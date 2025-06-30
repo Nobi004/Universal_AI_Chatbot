@@ -144,3 +144,12 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:8000",
     # Add your mobile app origins
 ]
+
+AI_CHATBOT = {
+    'DEFAULT_PROVIDER': 'openai',
+    'DEFAULT_MODEL': 'gpt-3.5-turbo',
+    'MAX_TOKENS': 2000,
+    'TEMPERATURE': 0.7,
+    'STREAMING_ENABLED': True,
+    'RATE_LIMIT_PER_DAY': 100,
+}
