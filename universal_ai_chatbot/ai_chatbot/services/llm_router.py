@@ -14,6 +14,7 @@ from mistralai.client import MistralClient
 from mistralai.models import ChatMessage as MistralMessage
 from django.conf import settings
 from ..models import LLMProvider, LLMModel, ChatMessage
+from huggingface_hub import InferenceClient
 
 logger = logging.getLogger('ai_chatbot')
 
@@ -445,6 +446,193 @@ class LLMRouter:
         except Exception as e:
             logger.error(f"Provider validation failed: {str(e)}")
             return False
+class HuggingFaceProvider(BaseLLMProvider):
+    """HuggingFace Inference API provider implementation."""
+    
+    def __init__(self, api_key: str, base_url: str = None):
+        super().__init__(api_key, base_url)
+        self.client = InferenceClient(token=api_key)
+        self.base_url = base_url or "https://api-inference.huggingface.co/models/"
+    
+    def get_response(
+        self,
+        messages: List[Dict[str, str]],
+        model: str,
+        temperature: float = 0.7,
+        max_tokens: int = 2000,
+        stream: bool = False,
+        **kwargs
+    ) -> Union[LLMResponse, Generator[str, None, None]]:
+        
+        start_time = time.time()
+        
+        # Convert messages to HuggingFace format
+        # HF expects a single prompt, so we need to format the conversation
+        prompt = self._format_conversation(messages)
+        
+        try:
+            if stream:
+                return self._stream_response(prompt, model, temperature, max_tokens, **kwargs)
+            
+            # For chat models
+            if self._is_chat_model(model):
+                response = self.client.chat_completion(
+                    messages=messages,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    **kwargs
+                )
+                content = response.choices[0].message.content
+            else:
+                # For text generation models
+                response = self.client.text_generation(
+                    prompt,
+                    model=model,
+                    temperature=temperature,
+                    max_new_tokens=max_tokens,
+                    return_full_text=False,
+                    **kwargs
+                )
+                content = response
+            
+            response_time_ms = int((time.time() - start_time) * 1000)
+            
+            # Estimate tokens (HF doesn't always provide token counts)
+            input_tokens = self.estimate_tokens(prompt)
+            output_tokens = self.estimate_tokens(content)
+            
+            return LLMResponse(
+                content=content,
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                response_time_ms=response_time_ms,
+                metadata={
+                    'provider': 'huggingface',
+                    'model_id': model
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"HuggingFace API error: {str(e)}")
+            raise
+    
+    def _stream_response(
+        self,
+        prompt: str,
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        **kwargs
+    ) -> Generator[str, None, None]:
+        """Stream response from HuggingFace."""
+        
+        try:
+            # For chat models with streaming
+            if self._is_chat_model(model):
+                messages = kwargs.get('original_messages', [])
+                stream = self.client.chat_completion(
+                    messages=messages,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    stream=True,
+                    **kwargs
+                )
+                
+                for chunk in stream:
+                    if chunk.choices[0].delta.content:
+                        yield chunk.choices[0].delta.content
+            else:
+                # For text generation models with streaming
+                stream = self.client.text_generation(
+                    prompt,
+                    model=model,
+                    temperature=temperature,
+                    max_new_tokens=max_tokens,
+                    return_full_text=False,
+                    stream=True,
+                    **kwargs
+                )
+                
+                for chunk in stream:
+                    if hasattr(chunk, 'token') and hasattr(chunk.token, 'text'):
+                        yield chunk.token.text
+                    elif isinstance(chunk, str):
+                        yield chunk
+                        
+        except Exception as e:
+            logger.error(f"HuggingFace streaming error: {str(e)}")
+            yield f"\n\nError: {str(e)}"
+    
+    def _format_conversation(self, messages: List[Dict[str, str]]) -> str:
+        """Format conversation for non-chat models."""
+        formatted = []
+        
+        for msg in messages:
+            role = msg['role']
+            content = msg['content']
+            
+            if role == 'system':
+                formatted.append(f"System: {content}")
+            elif role == 'user':
+                formatted.append(f"Human: {content}")
+            elif role == 'assistant':
+                formatted.append(f"Assistant: {content}")
+        
+        # Add prompt for assistant response
+        formatted.append("Assistant:")
+        
+        return "\n\n".join(formatted)
+    
+    def _is_chat_model(self, model: str) -> bool:
+        """Check if the model supports chat format."""
+        chat_models = [
+            'microsoft/DialoGPT',
+            'facebook/blenderbot',
+            'meta-llama/Llama-2',
+            'mistralai/Mixtral',
+            'HuggingFaceH4/zephyr',
+            'tiiuae/falcon',
+            'Qwen/Qwen',
+            'nvidia/Llama',
+            'google/gemma',
+            'upstage/SOLAR'
+        ]
+        
+        return any(model.lower().startswith(cm.lower()) for cm in chat_models)
+    
+    def get_response(
+        self,
+        messages: List[Dict[str, str]],
+        model: str,
+        temperature: float = 0.7,
+        max_tokens: int = 2000,
+        stream: bool = False,
+        **kwargs
+    ) -> Union[LLMResponse, Generator[str, None, None]]:
+        
+        # Store original messages for streaming
+        kwargs['original_messages'] = messages
+        
+        return super().get_response(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=stream,
+            **kwargs
+        )
+class LLMRouter:
+    """Routes requests to appropriate LLM providers."""
+    
+    _providers = {
+        'openai': OpenAIProvider,
+        'anthropic': AnthropicProvider,
+        'mistral': MistralProvider,
+        'huggingface': HuggingFaceProvider,  # Add this line
+    }
 
 
 # Singleton instance
