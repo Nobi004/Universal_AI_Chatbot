@@ -10,11 +10,12 @@ from dataclasses import dataclass
 
 import openai
 import anthropic
-from mistralai.client import MistralClient
-from mistralai.models import ChatMessage as MistralMessage
+from mistralai import Mistral
+from mistralai.models import ChatCompletionRequest, UserMessage, SystemMessage, AssistantMessage
+from huggingface_hub import InferenceClient
+
 from django.conf import settings
 from ..models import LLMProvider, LLMModel, ChatMessage
-from huggingface_hub import InferenceClient
 
 logger = logging.getLogger('ai_chatbot')
 
@@ -67,6 +68,10 @@ class BaseLLMProvider(ABC):
             {"role": msg.role, "content": msg.content}
             for msg in messages
         ]
+    
+    def estimate_tokens(self, text: str) -> int:
+        """Rough estimate of token count."""
+        return len(text) // 4
 
 
 class OpenAIProvider(BaseLLMProvider):
@@ -249,7 +254,7 @@ class MistralProvider(BaseLLMProvider):
     
     def __init__(self, api_key: str, base_url: str = None):
         super().__init__(api_key, base_url)
-        self.client = MistralClient(api_key=api_key)
+        self.client = Mistral(api_key=api_key)
     
     def get_response(
         self,
@@ -264,10 +269,14 @@ class MistralProvider(BaseLLMProvider):
         start_time = time.time()
         
         # Convert to Mistral message format
-        mistral_messages = [
-            MistralMessage(role=msg['role'], content=msg['content'])
-            for msg in messages
-        ]
+        mistral_messages = []
+        for msg in messages:
+            if msg['role'] == 'system':
+                mistral_messages.append(SystemMessage(content=msg['content']))
+            elif msg['role'] == 'user':
+                mistral_messages.append(UserMessage(content=msg['content']))
+            elif msg['role'] == 'assistant':
+                mistral_messages.append(AssistantMessage(content=msg['content']))
         
         try:
             if stream:
@@ -275,7 +284,7 @@ class MistralProvider(BaseLLMProvider):
                     mistral_messages, model, temperature, max_tokens, **kwargs
                 )
             
-            response = self.client.chat(
+            response = self.client.chat.complete(
                 model=model,
                 messages=mistral_messages,
                 temperature=temperature,
@@ -302,7 +311,7 @@ class MistralProvider(BaseLLMProvider):
     
     def _stream_response(
         self,
-        messages: List[MistralMessage],
+        messages: List,
         model: str,
         temperature: float,
         max_tokens: int,
@@ -310,7 +319,7 @@ class MistralProvider(BaseLLMProvider):
     ) -> Generator[str, None, None]:
         """Stream response from Mistral."""
         
-        stream = self.client.chat_stream(
+        stream = self.client.chat.stream(
             model=model,
             messages=messages,
             temperature=temperature,
@@ -319,133 +328,10 @@ class MistralProvider(BaseLLMProvider):
         )
         
         for chunk in stream:
-            if chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
+            if chunk.data.choices[0].delta.content:
+                yield chunk.data.choices[0].delta.content
 
 
-class LLMRouter:
-    """Routes requests to appropriate LLM providers."""
-    
-    _providers = {
-        'openai': OpenAIProvider,
-        'anthropic': AnthropicProvider,
-        'mistral': MistralProvider,
-    }
-    
-    def __init__(self):
-        self._provider_instances = {}
-    
-    def get_provider(self, provider_type: str, api_key: str, base_url: str = None) -> BaseLLMProvider:
-        """Get or create a provider instance."""
-        cache_key = f"{provider_type}:{api_key[:8]}"
-        
-        if cache_key not in self._provider_instances:
-            if provider_type not in self._providers:
-                raise ValueError(f"Unknown provider type: {provider_type}")
-            
-            provider_class = self._providers[provider_type]
-            self._provider_instances[cache_key] = provider_class(api_key, base_url)
-        
-        return self._provider_instances[cache_key]
-    
-    @classmethod
-    def register_provider(cls, name: str, provider_class: type):
-        """Register a new provider type."""
-        if not issubclass(provider_class, BaseLLMProvider):
-            raise ValueError("Provider class must inherit from BaseLLMProvider")
-        cls._providers[name] = provider_class
-    
-    def get_response(
-        self,
-        provider: LLMProvider,
-        model: LLMModel,
-        messages: List[ChatMessage],
-        temperature: float = 0.7,
-        max_tokens: int = 2000,
-        stream: bool = False,
-        user_api_key: str = None,
-        **kwargs
-    ) -> Union[LLMResponse, Generator[str, None, None]]:
-        """
-        Get response from the appropriate LLM provider.
-        
-        Args:
-            provider: LLMProvider instance
-            model: LLMModel instance
-            messages: List of ChatMessage objects
-            temperature: Temperature setting
-            max_tokens: Maximum tokens to generate
-            stream: Whether to stream the response
-            user_api_key: Optional user-specific API key
-            **kwargs: Additional provider-specific parameters
-        
-        Returns:
-            LLMResponse object or generator for streaming
-        """
-        
-        # Use user's API key if provided, otherwise use system key
-        api_key = user_api_key or provider.api_key
-        
-        # Get the provider instance
-        provider_instance = self.get_provider(
-            provider.provider_type,
-            api_key,
-            provider.base_url
-        )
-        
-        # Format messages for the provider
-        formatted_messages = provider_instance.format_messages(messages)
-        
-        # Get response from provider
-        return provider_instance.get_response(
-            messages=formatted_messages,
-            model=model.name,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=stream,
-            **kwargs
-        )
-    
-    @staticmethod
-    def estimate_tokens(text: str) -> int:
-        """Rough estimate of token count."""
-        # Simple estimation: ~4 characters per token
-        return len(text) // 4
-    
-    @staticmethod
-    def validate_provider_config(provider_type: str, api_key: str, base_url: str = None) -> bool:
-        """Validate provider configuration by making a test request."""
-        try:
-            router = LLMRouter()
-            provider = router.get_provider(provider_type, api_key, base_url)
-            
-            # Make a simple test request
-            test_messages = [{"role": "user", "content": "Hello"}]
-            
-            if provider_type == 'openai':
-                response = provider.get_response(
-                    messages=test_messages,
-                    model='gpt-3.5-turbo',
-                    max_tokens=10
-                )
-            elif provider_type == 'anthropic':
-                response = provider.get_response(
-                    messages=test_messages,
-                    model='claude-3-haiku-20240307',
-                    max_tokens=10
-                )
-            elif provider_type == 'mistral':
-                response = provider.get_response(
-                    messages=test_messages,
-                    model='mistral-tiny',
-                    max_tokens=10
-                )
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Provider validation failed: {str(e)}")
-            return False
 class HuggingFaceProvider(BaseLLMProvider):
     """HuggingFace Inference API provider implementation."""
     
@@ -465,6 +351,9 @@ class HuggingFaceProvider(BaseLLMProvider):
     ) -> Union[LLMResponse, Generator[str, None, None]]:
         
         start_time = time.time()
+        
+        # Store original messages for streaming
+        kwargs['original_messages'] = messages
         
         # Convert messages to HuggingFace format
         # HF expects a single prompt, so we need to format the conversation
@@ -598,32 +487,17 @@ class HuggingFaceProvider(BaseLLMProvider):
             'Qwen/Qwen',
             'nvidia/Llama',
             'google/gemma',
-            'upstage/SOLAR'
+            'upstage/SOLAR',
+            'codellama/CodeLlama',
+            'teknium/OpenHermes',
+            'TheBloke/',
+            'NousResearch/',
+            'togethercomputer/',
         ]
         
         return any(model.lower().startswith(cm.lower()) for cm in chat_models)
-    
-    def get_response(
-        self,
-        messages: List[Dict[str, str]],
-        model: str,
-        temperature: float = 0.7,
-        max_tokens: int = 2000,
-        stream: bool = False,
-        **kwargs
-    ) -> Union[LLMResponse, Generator[str, None, None]]:
-        
-        # Store original messages for streaming
-        kwargs['original_messages'] = messages
-        
-        return super().get_response(
-            messages=messages,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=stream,
-            **kwargs
-        )
+
+
 class LLMRouter:
     """Routes requests to appropriate LLM providers."""
     
@@ -631,8 +505,129 @@ class LLMRouter:
         'openai': OpenAIProvider,
         'anthropic': AnthropicProvider,
         'mistral': MistralProvider,
-        'huggingface': HuggingFaceProvider,  # Add this line
+        'huggingface': HuggingFaceProvider,
     }
+    
+    def __init__(self):
+        self._provider_instances = {}
+    
+    def get_provider(self, provider_type: str, api_key: str, base_url: str = None) -> BaseLLMProvider:
+        """Get or create a provider instance."""
+        cache_key = f"{provider_type}:{api_key[:8]}"
+        
+        if cache_key not in self._provider_instances:
+            if provider_type not in self._providers:
+                raise ValueError(f"Unknown provider type: {provider_type}")
+            
+            provider_class = self._providers[provider_type]
+            self._provider_instances[cache_key] = provider_class(api_key, base_url)
+        
+        return self._provider_instances[cache_key]
+    
+    @classmethod
+    def register_provider(cls, name: str, provider_class: type):
+        """Register a new provider type."""
+        if not issubclass(provider_class, BaseLLMProvider):
+            raise ValueError("Provider class must inherit from BaseLLMProvider")
+        cls._providers[name] = provider_class
+    
+    def get_response(
+        self,
+        provider: LLMProvider,
+        model: LLMModel,
+        messages: List[ChatMessage],
+        temperature: float = 0.7,
+        max_tokens: int = 2000,
+        stream: bool = False,
+        user_api_key: str = None,
+        **kwargs
+    ) -> Union[LLMResponse, Generator[str, None, None]]:
+        """
+        Get response from the appropriate LLM provider.
+        
+        Args:
+            provider: LLMProvider instance
+            model: LLMModel instance
+            messages: List of ChatMessage objects
+            temperature: Temperature setting
+            max_tokens: Maximum tokens to generate
+            stream: Whether to stream the response
+            user_api_key: Optional user-specific API key
+            **kwargs: Additional provider-specific parameters
+        
+        Returns:
+            LLMResponse object or generator for streaming
+        """
+        
+        # Use user's API key if provided, otherwise use system key
+        api_key = user_api_key or provider.api_key
+        
+        # Get the provider instance
+        provider_instance = self.get_provider(
+            provider.provider_type,
+            api_key,
+            provider.base_url
+        )
+        
+        # Format messages for the provider
+        formatted_messages = provider_instance.format_messages(messages)
+        
+        # Get response from provider
+        return provider_instance.get_response(
+            messages=formatted_messages,
+            model=model.name,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=stream,
+            **kwargs
+        )
+    
+    @staticmethod
+    def estimate_tokens(text: str) -> int:
+        """Rough estimate of token count."""
+        # Simple estimation: ~4 characters per token
+        return len(text) // 4
+    
+    @staticmethod
+    def validate_provider_config(provider_type: str, api_key: str, base_url: str = None) -> bool:
+        """Validate provider configuration by making a test request."""
+        try:
+            router = LLMRouter()
+            provider = router.get_provider(provider_type, api_key, base_url)
+            
+            # Make a simple test request
+            test_messages = [{"role": "user", "content": "Hello"}]
+            
+            if provider_type == 'openai':
+                response = provider.get_response(
+                    messages=test_messages,
+                    model='gpt-3.5-turbo',
+                    max_tokens=10
+                )
+            elif provider_type == 'anthropic':
+                response = provider.get_response(
+                    messages=test_messages,
+                    model='claude-3-haiku-20240307',
+                    max_tokens=10
+                )
+            elif provider_type == 'mistral':
+                response = provider.get_response(
+                    messages=test_messages,
+                    model='mistral-tiny',
+                    max_tokens=10
+                )
+            elif provider_type == 'huggingface':
+                response = provider.get_response(
+                    messages=test_messages,
+                    model='microsoft/DialoGPT-small',
+                    max_tokens=10
+                )
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Provider validation failed: {str(e)}")
+            return False
 
 
 # Singleton instance
