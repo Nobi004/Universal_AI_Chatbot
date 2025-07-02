@@ -185,6 +185,35 @@
                     </button>
                 </div>
             </div>
+            <!-- Add this after the API Keys Section -->
+            <div class="card mt-4">
+                <div class="card-header">
+                    <h4 class="mb-0">HuggingFace Models</h4>
+                </div>
+                <div class="card-body">
+                    <p class="text-muted">
+                        Add custom models from HuggingFace Model Hub to use in your chats.
+                    </p>
+                    <a href="{% url 'ai_chatbot:add_hf_model' %}" class="btn btn-primary">
+                        <i class="bi bi-plus-circle"></i> Add HuggingFace Model
+                    </a>
+                    
+                    {% if providers %}
+                    <div class="mt-3">
+                        <h6>Available Providers:</h6>
+                        <ul class="list-unstyled">
+                            {% for provider in providers %}
+                            <li>
+                                <i class="bi bi-check-circle text-success"></i> 
+                                {{ provider.name }} 
+                                <small class="text-muted">({{ provider.models.count }} models)</small>
+                            </li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
         </div>
     </div>
 </div>
