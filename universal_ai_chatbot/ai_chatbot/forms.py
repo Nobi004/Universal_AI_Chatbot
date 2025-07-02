@@ -2,7 +2,7 @@
 
 from django import forms
 from django.core.validators import MinValueValidator, MaxValueValidator
-from .models import ChatMessage, ChatSession, LLMConfig, LLMModel
+from .models import ChatMessage, ChatSession, LLMConfig, LLMModel, LLMProvider
 
 
 class ChatMessageForm(forms.Form):
@@ -140,3 +140,55 @@ class ModelSelectionForm(forms.Form):
         super().__init__(*args, **kwargs)
         if initial_model:
             self.fields['model'].initial = initial_model
+
+
+class CustomHuggingFaceModelForm(forms.Form):
+    """Form for adding custom HuggingFace models."""
+    model_id = forms.CharField(
+        max_length=200,
+        widget=forms.TextInput(attrs={
+            'class': 'form-control',
+            'placeholder': 'e.g., microsoft/DialoGPT-medium'
+        }),
+        help_text='Enter the HuggingFace model ID (username/model-name)'
+    )
+    display_name = forms.CharField(
+        max_length=100,
+        widget=forms.TextInput(attrs={
+            'class': 'form-control',
+            'placeholder': 'e.g., DialoGPT Medium'
+        })
+    )
+    description = forms.CharField(
+        required=False,
+        widget=forms.Textarea(attrs={
+            'class': 'form-control',
+            'rows': 3
+        })
+    )
+    max_tokens = forms.IntegerField(
+        initial=2048,
+        widget=forms.NumberInput(attrs={
+            'class': 'form-control',
+            'min': '128',
+            'max': '32768'
+        })
+    )
+    
+    def clean_model_id(self):
+        model_id = self.cleaned_data['model_id']
+        
+        # Basic validation of model ID format
+        if '/' not in model_id:
+            raise forms.ValidationError(
+                'Model ID should be in format: username/model-name'
+            )
+        
+        # Check if model already exists
+        if LLMModel.objects.filter(
+            name=model_id,
+            provider__provider_type='huggingface'
+        ).exists():
+            raise forms.ValidationError('This model has already been added.')
+        
+        return model_id
