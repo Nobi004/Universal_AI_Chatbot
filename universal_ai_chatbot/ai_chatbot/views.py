@@ -16,8 +16,26 @@ from datetime import date
 from .models import ChatSession, ChatMessage, LLMModel, LLMConfig, UsageLog
 from .forms import ChatMessageForm, ChatSessionForm, LLMConfigForm
 from .services.llm_router import llm_router
+from .forms import CustomHuggingFaceModelForm
+# Add this import at the top if not already there
+from django.shortcuts import redirect
+from django.contrib.auth.forms import UserCreationForm
+from django.urls import reverse_lazy
+from django.views.generic import CreateView
 
 
+# Add this view function
+def home_view(request):
+    """Redirect home page to chat sessions list."""
+    if request.user.is_authenticated:
+        return redirect('ai_chatbot:session_list')
+    else:
+        return redirect('login')  # Or wherever your login page is
+
+class RegisterView(CreateView):
+    template_name = 'registration/register.html'
+    form_class = UserCreationForm
+    success_url = reverse_lazy('login')
 class ChatSessionListView(LoginRequiredMixin, ListView):
     """List all chat sessions for the current user."""
     model = ChatSession
@@ -313,6 +331,11 @@ class LLMConfigUpdateView(LoginRequiredMixin, UpdateView):
             }
         )
         return config
+    
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context['providers'] = LLMProvider.objects.filter(is_active=True)
+        return context
 
 
 @login_required
@@ -334,3 +357,41 @@ def new_chat(request):
     )
     
     return redirect('ai_chatbot:chat', pk=session.id)
+
+# Add this view function
+@login_required
+def add_huggingface_model(request):
+    """Add a custom HuggingFace model."""
+    if request.method == 'POST':
+        form = CustomHuggingFaceModelForm(request.POST)
+        if form.is_valid():
+            # Get HuggingFace provider
+            hf_provider = LLMProvider.objects.get(provider_type='huggingface')
+            
+            # Create the model
+            model = LLMModel.objects.create(
+                provider=hf_provider,
+                name=form.cleaned_data['model_id'],
+                display_name=form.cleaned_data['display_name'],
+                description=form.cleaned_data['description'],
+                max_tokens=form.cleaned_data['max_tokens'],
+                supports_streaming=True,
+                supports_functions=False,
+                is_active=True
+            )
+            
+            messages.success(request, f'Successfully added {model.display_name}')
+            return redirect('ai_chatbot:config')
+    else:
+        form = CustomHuggingFaceModelForm()
+    
+    # Get existing HuggingFace models for display
+    hf_models = LLMModel.objects.filter(
+        provider__provider_type='huggingface',
+        is_active=True
+    ).order_by('display_name')
+    
+    return render(request, 'ai_chatbot/add_hf_model.html', {
+        'form': form,
+        'existing_models': hf_models
+    })
